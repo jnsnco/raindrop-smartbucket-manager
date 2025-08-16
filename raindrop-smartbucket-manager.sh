@@ -49,6 +49,51 @@ print_info() {
     echo -e "${PURPLE}ℹ $1${NC}"
 }
 
+# Format and display search results
+display_search_results() {
+    local response="$1"
+    local description="$2"
+    
+    echo -e "${CYAN}$description:${NC}"
+    
+    # Check if response contains results
+    if echo "$response" | jq -e '.results' >/dev/null 2>&1; then
+        local results_count=$(echo "$response" | jq '.results | length')
+        echo -e "${GREEN}Found $results_count result(s)${NC}"
+        echo ""
+        
+        # Display each result
+        echo "$response" | jq -r '.results[] | 
+            "Result ID: " + (.chunkSignature // "N/A") + 
+            "\nSource: " + (.source.objectKey // "N/A") + 
+            "\nContent: " + (.content // "N/A") + 
+            "\nScore: " + (.score // 0 | tostring) + 
+            "\n" + ("-" * 50)'
+        
+        # Display pagination info if available
+        if echo "$response" | jq -e '.hasMorePages' >/dev/null 2>&1; then
+            local has_more=$(echo "$response" | jq -r '.hasMorePages')
+            local current_page=$(echo "$response" | jq -r '.currentPage // 1')
+            echo ""
+            echo -e "${YELLOW}Pagination: Page $current_page${NC}"
+            if [ "$has_more" = "true" ]; then
+                echo -e "${YELLOW}More pages available - use option 7 to get next page${NC}"
+            else
+                echo -e "${GREEN}This is the last page${NC}"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}No results field found in response${NC}"
+        # Fall back to raw JSON display
+        if echo "$response" | jq empty 2>/dev/null; then
+            echo "$response" | jq '.'
+        else
+            echo "$response"
+        fi
+    fi
+    echo ""
+}
+
 # Pretty print curl command and response
 execute_curl() {
     local curl_cmd="$1"
@@ -91,6 +136,41 @@ execute_curl() {
     return $exit_code
 }
 
+# Execute curl and display search results in formatted way
+execute_search_curl() {
+    local curl_cmd="$1"
+    local description="$2"
+    
+    echo -e "${YELLOW}Executing: $description${NC}"
+    echo -e "${CYAN}Curl Command:${NC}"
+    echo "$curl_cmd"
+    echo ""
+    
+    local response=$(eval "$curl_cmd" 2>&1)
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        # Check if response contains error indicators
+        if echo "$response" | grep -q "not_found\|error\|Error\|ERROR"; then
+            print_error "API returned an error"
+            echo "$response" | jq '.' 2>/dev/null || echo "$response"
+            return 1
+        elif echo "$response" | grep -q "unauthorized\|Unauthorized\|UNAUTHORIZED"; then
+            print_error "Authentication failed - check your API key"
+            return 1
+        else
+            print_success "Request completed successfully"
+            display_search_results "$response" "$description"
+        fi
+    else
+        print_error "Request failed with exit code: $exit_code"
+        echo "$response"
+    fi
+    
+    echo ""
+    return $exit_code
+}
+
 # Load configuration from environment and manifest
 load_config() {
     # Parse manifest file to get first bucket name
@@ -109,7 +189,7 @@ setup_credentials() {
     echo ""
     
     if [ -n "${RAINDROP_API_KEY:-}" ]; then
-        print_success "API key is set: ${RAINDROP_API_KEY:0:10}..."
+        print_success "API key is set: ${RAINDROP_API_KEY:0:16}..."
     else
         print_warning "RAINDROP_API_KEY environment variable not set"
     fi
@@ -348,8 +428,17 @@ semantic_search() {
     echo -n "Enter search query: "
     read search_query
     
-    echo -n "Enter request ID (optional, press Enter to skip): "
+    echo -n "Enter request ID (press Enter to generate new): "
     read request_id
+    
+    # Trim whitespace from request_id
+    request_id=$(echo "$request_id" | xargs)
+    
+    # Generate UUID if no request_id provided
+    if [ -z "$request_id" ]; then
+        request_id=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "$(date +%s)-$$-$RANDOM")
+        print_info "Generated request ID: $request_id"
+    fi
     
     # Use the bucket name directly
     if [ -z "$BUCKET_NAME" ]; then
@@ -367,15 +456,86 @@ semantic_search() {
         --arg req_id "$request_id" \
         '{
             input: $input,
-            buckets: [$bucket]
-        } + (if $req_id != "" then {request_id: $req_id} else {} end)')
+            bucket_locations: [
+                {
+                    bucket: {
+                        name: $bucket
+                    }
+                }
+            ],
+            request_id: $req_id
+        }')
     
     local curl_cmd="curl -s -X POST \"$API_BASE_URL/v1/search\" \
         -H \"Authorization: Bearer $RAINDROP_API_KEY\" \
         -H \"Content-Type: application/json\" \
         -d '$json_payload'"
     
-    execute_curl "$curl_cmd" "Semantic search"
+    if ! execute_curl "$curl_cmd" "Initiate semantic search"; then
+        return 1
+    fi
+    
+    # Step 2: Get the first page of results
+    print_info "Getting first page of results..."
+    local get_page_payload=$(jq -n \
+        --arg req_id "$request_id" \
+        '{
+            request_id: $req_id,
+            page: 1
+        }')
+    
+    local get_page_cmd="curl -s -X POST \"$API_BASE_URL/v1/search_get_page\" \
+        -H \"Authorization: Bearer $RAINDROP_API_KEY\" \
+        -H \"Content-Type: application/json\" \
+        -d '$get_page_payload'"
+    
+    execute_search_curl "$get_page_cmd" "Search Results (page 1)"
+}
+
+# Get additional search pages
+get_search_page() {
+    print_section "Get Search Page"
+    
+    if [ -z "${RAINDROP_API_KEY:-}" ]; then
+        print_error "API key not set. Please run setup first."
+        return 1
+    fi
+    
+    echo -n "Enter request ID from previous search: "
+    read request_id
+    
+    # Trim whitespace from request_id
+    request_id=$(echo "$request_id" | xargs)
+    
+    if [ -z "$request_id" ]; then
+        print_error "Request ID is required"
+        return 1
+    fi
+    
+    echo -n "Enter page number: "
+    read page_num
+    
+    if [ -z "$page_num" ]; then
+        page_num=1
+    fi
+    
+    print_info "Getting page $page_num for request ID: $request_id"
+    
+    # Prepare JSON payload
+    local json_payload=$(jq -n \
+        --arg req_id "$request_id" \
+        --argjson page "$page_num" \
+        '{
+            request_id: $req_id,
+            page: $page
+        }')
+    
+    local curl_cmd="curl -s -X POST \"$API_BASE_URL/v1/search_get_page\" \
+        -H \"Authorization: Bearer $RAINDROP_API_KEY\" \
+        -H \"Content-Type: application/json\" \
+        -d '$json_payload'"
+    
+    execute_search_curl "$curl_cmd" "Search Results (page $page_num)"
 }
 
 # Document query (natural language)
@@ -390,8 +550,17 @@ document_query() {
     echo -n "Enter your question: "
     read query
     
-    echo -n "Enter request ID (optional, press Enter to skip): "
+    echo -n "Enter request ID (press Enter to generate new): "
     read request_id
+    
+    # Trim whitespace from request_id
+    request_id=$(echo "$request_id" | xargs)
+    
+    # Generate UUID if no request_id provided
+    if [ -z "$request_id" ]; then
+        request_id=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "$(date +%s)-$$-$RANDOM")
+        print_info "Generated request ID: $request_id"
+    fi
     
     # Use the bucket name directly
     if [ -z "$BUCKET_NAME" ]; then
@@ -409,8 +578,15 @@ document_query() {
         --arg req_id "$request_id" \
         '{
             input: $input,
-            buckets: [$bucket]
-        } + (if $req_id != "" then {request_id: $req_id} else {} end)')
+            bucket_locations: [
+                {
+                    bucket: {
+                        name: $bucket
+                    }
+                }
+            ],
+            request_id: $req_id
+        }')
     
     local curl_cmd="curl -s -X POST \"$API_BASE_URL/v1/document_query\" \
         -H \"Authorization: Bearer $RAINDROP_API_KEY\" \
@@ -457,7 +633,13 @@ summarize_document() {
         --arg bucket "$BUCKET_NAME" \
         '{
             input: $input,
-            buckets: [$bucket]
+            bucket_locations: [
+                {
+                    bucket: {
+                        name: $bucket
+                    }
+                }
+            ]
         }')
     
     local curl_cmd="curl -s -X POST \"$API_BASE_URL/v1/document_query\" \
@@ -537,13 +719,14 @@ show_menu() {
     echo "4. List documents"
     echo "5. Delete document"
     echo "6. Semantic search"
-    echo "7. Natural language document query"
-    echo "8. Summarize document/page"
-    echo "9. Show current configuration"
+    echo "7. Get additional search pages"
+    echo "8. Natural language document query"
+    echo "9. Summarize document/page"
+    echo "10. Show current configuration"
     echo "d. Debug bucket resolution"
     echo "0. Exit"
     echo ""
-    echo -n "Enter your choice [0-9,d]: "
+    echo -n "Enter your choice [0-10,d]: "
 }
 
 # Main execution
@@ -573,8 +756,12 @@ main() {
                 setup_credentials
                 ;;
             2)
-                create_manifest
-                build_smartbucket
+                echo -en "\nHaven't figured out how to do this via API yet, or if it's even possible. For now, you need to use an existing SmartBucket.
+If you don't have one, refer to this tutorial, then ask ${YELLOW}Claude Code${NC} to build a simple SmartBucket app.
+${BLUE}https://docs.liquidmetal.ai/tutorials/claude-code-mcp-setup/${NC}\n
+Once that's done, copy the raindrop.manifest to the same directory as this script.\n" 
+                # create_manifest
+                # build_smartbucket
                 ;;
             3)
                 upload_document
@@ -589,12 +776,15 @@ main() {
                 semantic_search
                 ;;
             7)
-                document_query
+                get_search_page
                 ;;
             8)
-                summarize_document
+                document_query
                 ;;
             9)
+                summarize_document
+                ;;
+            10)
                 show_config
                 ;;
             d|D)
@@ -605,7 +795,7 @@ main() {
                 exit 0
                 ;;
             *)
-                print_error "Invalid option. Please choose 0-9 or d."
+                print_error "Invalid option. Please choose 0-10 or d."
                 ;;
         esac
         
